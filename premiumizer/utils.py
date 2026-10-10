@@ -51,7 +51,11 @@ def update():
     if prem_config.getfloat('update', 'req_version') < default_config.getfloat('update', 'req_version'):
         logging.info('updating pip requirements')
         subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--upgrade', 'pip'])
-        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', os.path.join(rootdir, 'requirements.txt')])
+        req_file = os.path.join(runningdir, 'requirements.txt')
+        if not os.path.isfile(req_file):
+            req_file = os.path.join(rootdir, 'requirements.txt')
+        if os.path.isfile(req_file):
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', req_file])
         prem_config.set('update', 'req_version', str(default_config.getfloat('update', 'req_version')))
         with open(os.path.join(ConfDir, 'settings.cfg'), 'w') as configfile:
             prem_config.write(configfile)
