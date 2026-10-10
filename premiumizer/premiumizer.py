@@ -1537,16 +1537,17 @@ def process_dir(dir_content, path):
             subdir_content = json.loads(r.content)['content']
             process_dir(subdir_content, subdir_path)
         elif type == 'file':
-            if greenlet.task.dlext_blacklist:
-                if greenlet.task.dlext[0] == '' or not x['link'].lower().endswith(tuple(greenlet.task.dlext)):
-                    download_file_continue = 1
-                else:
+            is_ext_match = x['name'].lower().endswith(tuple(greenlet.task.dlext)) or x['link'].lower().endswith(tuple(greenlet.task.dlext))
+            if is_ext_match:
+                if greenlet.task.dlext_blacklist:
                     logger.debug('Skipping download of file %s because extension is blacklisted', x['name'])
-            else:
-                if x['link'].lower().endswith(tuple(greenlet.task.dlext)):
-                    download_file_continue = 1
                 else:
+                    download_file_continue = 1
+            else:
+                if not greenlet.task.dlext_blacklist:
                     logger.debug('Skipping download of file %s because extension is not whitelisted', x['name'])
+                    continue
+                download_file_continue = 1
             if download_file_continue:
                 if greenlet.task.delsample:
                     sample = is_sample(x)
@@ -1621,7 +1622,8 @@ def download_task(task):
         task.update(progress=100)
         gevent.sleep(3)
         try:
-            shutil.rmtree(task.dldir)
+            if not task.dldir == get_cat_var(task.category)[0]:
+                shutil.rmtree(task.dldir)
         except:
             if not cfg.jd_enabled:
                 logger.warning('Could not delete folder for: %s', greenlet.task.name)
@@ -1821,23 +1823,38 @@ def parse_tasks(transfers):
         except:
             file_id = None
         if not task:
+            guessed_cat = ''
+            if re.search(r'[sS]\d+[eE]\d+|[sS]eason|\bS\d+\b', name, re.I):
+                guessed_cat = 'tv'
+            elif re.search(r'\b(19\d\d|20\d\d)\b', name):
+                guessed_cat = 'movies'
             if cfg.download_all:
-                add_task(transfer['id'], size, name, 'default', folder_id=folder_id)
+                add_task(transfer['id'], size, name, guessed_cat or 'default', folder_id=folder_id)
             else:
-                add_task(transfer['id'], size, name, '', folder_id=folder_id)
+                add_task(transfer['id'], size, name, guessed_cat, folder_id=folder_id)
             task = get_task(transfer['id'], name)
             id_local.append(task.id)
             task.update(name=name, progress=progress, cloud_status=transfer['status'], dlsize=size + ' --- ',
                         speed=speed + ' --- ', eta=eta, file_id=file_id)
         if task.local_status is None:
-            if task.cloud_status != 'finished' and task.cloud_status != 'seeding':
+            if transfer['status'] not in ('finished', 'seeding'):
                 task.update(name=name, progress=progress, cloud_status=transfer['status'], dlsize=size + ' --- ',
                             speed=speed + ' --- ', eta=eta, folder_id=folder_id, file_id=file_id)
                 idle = False
-            elif task.cloud_status == 'finished' or task.cloud_status == 'seeding':
+            else:
                 if cfg.download_enabled and downloader_connection():
                     if task.category == '':
-                        if cfg.download_rss and transfer['folder_id']:
+                        guessed_cat = ''
+                        if re.search(r'[sS]\d+[eE]\d+|[sS]eason|\bS\d+\b', task.name, re.I):
+                            guessed_cat = 'tv'
+                        elif re.search(r'\b(19\d\d|20\d\d)\b', task.name):
+                            guessed_cat = 'movies'
+                        if guessed_cat:
+                            dldir, dlext, dlext_blacklist, delsample, dlnzbtomedia = get_cat_var(guessed_cat)
+                            task.update(category=guessed_cat, dldir=dldir, dlext=dlext,
+                                        dlext_blacklist=dlext_blacklist, delsample=delsample,
+                                        dlnzbtomedia=dlnzbtomedia)
+                        elif cfg.download_rss and transfer['folder_id']:
                             try:
                                 r = prem_connection("post", "https://www.premiumize.me/api/folder/list",
                                                     {'apikey': cfg.prem_apikey, 'id': transfer['folder_id'],
@@ -1861,7 +1878,7 @@ def parse_tasks(transfers):
                         elif cfg.download_all:
                             task.update(name=name, cloud_status=transfer['status'], category='default')
                     if task.category in cfg.download_categories:
-                        if not task.local_status == ('queued' or 'downloading'):
+                        if task.local_status not in ('queued', 'downloading'):
                             task.update(name=name, cloud_status=transfer['status'], local_status='queued',
                                         folder_id=folder_id,
                                         file_id=file_id, dlsize='')
@@ -2031,6 +2048,13 @@ def add_task(id, size, name, category, type='', folder_id=None):
         tasks.append(task)
         if not task.type == 'Filehost':
             logger.info('Added: %s -- Category: %s -- Type: %s -- id: %s', task.name, task.category, task.type, task.id)
+        task.callback = None
+        db[task.id] = task
+        task.callback = socketio.emit
+        try:
+            db.sync()
+        except:
+            pass
     else:
         task = 'duplicate'
     return task
@@ -2826,7 +2850,7 @@ def change_category(message):
                         dlext=dlext, dlext_blacklist=dlext_blacklist, delsample=delsample, dlnzbtomedia=dlnzbtomedia)
             if cfg.download_enabled:
                 if task.category in cfg.download_categories:
-                    if not task.local_status == ('queued' or 'downloading'):
+                    if task.local_status not in ('queued', 'downloading'):
                         task.update(local_status='queued')
                         gevent.sleep(3)
                         scheduler.scheduler.add_job(download_task, args=(task,), name=task.name, id=task.id,
@@ -2838,6 +2862,24 @@ def change_category(message):
         logger.info('Task: %s -- id: %s -- Category set to: %s', task.name, task.id, task.category)
         scheduler.scheduler.reschedule_job('update', trigger='interval', seconds=1)
 
+
+from apscheduler.schedulers.base import STATE_STOPPED, TIMEOUT_MAX
+
+def _safe_gevent_main_loop(self):
+    wait_seconds = 5
+    while self.state != STATE_STOPPED:
+        try:
+            self._event.wait(wait_seconds)
+            self._event.clear()
+            wait_seconds = self._process_jobs()
+            if wait_seconds is None or wait_seconds > 5:
+                wait_seconds = 5
+        except BaseException as e:
+            logger.error('Recovered from scheduler exception in _main_loop: %s', e)
+            gevent.sleep(2)
+            wait_seconds = 1
+
+GeventScheduler._main_loop = _safe_gevent_main_loop
 
 # start the server with the 'run()' method
 logger.info('Starting server on %s:%s ', prem_config.get('global', 'bind_ip'),
